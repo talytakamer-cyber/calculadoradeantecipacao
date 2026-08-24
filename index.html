@@ -1,0 +1,484 @@
+import React, { useState, useEffect, useMemo, useRef } from "react";
+import * as XLSX from "xlsx";
+import { Plus, Trash2, Upload, Crown, Info, X } from "lucide-react";
+
+// ---------- helpers ----------
+const uid = () => Math.random().toString(36).slice(2, 9);
+
+function parseValor(v) {
+  if (typeof v === "number") return isNaN(v) ? 0 : v;
+  if (v == null) return 0;
+  let s = String(v).trim().replace(/R\$/gi, "").replace(/\s/g, "");
+  if (s === "") return 0;
+  if (s.indexOf(",") > -1) s = s.replace(/\./g, "").replace(",", ".");
+  const n = parseFloat(s);
+  return isNaN(n) ? 0 : n;
+}
+
+function parseDate(v) {
+  if (v instanceof Date) return isNaN(v) ? null : v;
+  if (v == null) return null;
+  const s = String(v).trim();
+  let m = s.match(/^(\d{1,2})\/(\d{1,2})\/(\d{2,4})$/);
+  if (m) { let y = +m[3]; if (y < 100) y += 2000; return new Date(y, +m[2] - 1, +m[1]); }
+  m = s.match(/^(\d{4})-(\d{1,2})-(\d{1,2})/);
+  if (m) return new Date(+m[1], +m[2] - 1, +m[3]);
+  const d = new Date(s);
+  return isNaN(d) ? null : d;
+}
+
+const toISO = (d) => (d ? `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, "0")}-${String(d.getDate()).padStart(2, "0")}` : "");
+const numToStr = (n) => n.toLocaleString("pt-BR", { minimumFractionDigits: 2, maximumFractionDigits: 2 });
+const brl = (n) => n.toLocaleString("pt-BR", { style: "currency", currency: "BRL" });
+const pct = (n) => n.toLocaleString("pt-BR", { minimumFractionDigits: 2, maximumFractionDigits: 2 }) + "%";
+const daysBetween = (a, b) => Math.round((b - a) / 86400000);
+const todayISO = () => toISO(new Date());
+
+// ---------- seeds ----------
+const seedProviders = () => [
+  { id: uid(), nome: "Banco A", taxaMensal: "1,32", cobraIof: true, tarifaPorTitulo: "0,99", tarifaPorCliente: "0", tarifaPorOperacao: "0" },
+  { id: uid(), nome: "Banco B", taxaMensal: "1,75", cobraIof: false, tarifaPorTitulo: "5,00", tarifaPorCliente: "15,00", tarifaPorOperacao: "199,90" },
+];
+
+function seedReceivables() {
+  const base = new Date();
+  const plus = (d) => { const x = new Date(base); x.setDate(x.getDate() + d); return toISO(x); };
+  const emit = toISO(base);
+  return [
+    { id: uid(), cliente: "Transportes Aurora", emissao: emit, vencimento: plus(30), valor: "12.500,00" },
+    { id: uid(), cliente: "Distribuidora Vale", emissao: emit, vencimento: plus(45), valor: "8.200,00" },
+    { id: uid(), cliente: "Comercial Ipê", emissao: emit, vencimento: plus(60), valor: "21.000,00" },
+    { id: uid(), cliente: "Transportes Aurora", emissao: emit, vencimento: plus(28), valor: "6.750,00" },
+  ];
+}
+
+const DEFAULT_SETTINGS = { dataAntecipacao: todayISO(), iofDiario: "0,0041", iofAdicional: "0,38" };
+
+// ---------- calculation ----------
+function calcProvider(p, receivables, settings) {
+  const dataAntec = parseDate(settings.dataAntecipacao) || new Date();
+  const taxa = parseValor(p.taxaMensal);
+  const boleto = parseValor(p.tarifaPorTitulo);
+  const iofDia = parseValor(settings.iofDiario) / 100;
+  const iofAdd = parseValor(settings.iofAdicional) / 100;
+  let juros = 0, iof = 0, boletos = 0, bruto = 0, titulos = 0, somaDias = 0;
+  const clientes = new Set();
+  receivables.forEach((r) => {
+    const venc = parseDate(r.vencimento);
+    const V = parseValor(r.valor);
+    if (!venc || V <= 0) return;
+    const dias = Math.max(0, daysBetween(dataAntec, venc));
+    bruto += V; titulos += 1; somaDias += dias;
+    juros += V * (taxa / 100) / 30 * dias;
+    if (p.cobraIof) iof += V * (iofDia * Math.min(dias, 365) + iofAdd);
+    boletos += boleto;
+    const c = (r.cliente || "").trim().toLowerCase();
+    if (c) clientes.add(c);
+  });
+  const consulta = clientes.size * parseValor(p.tarifaPorCliente);
+  const operacao = parseValor(p.tarifaPorOperacao);
+  const custoTotal = juros + iof + boletos + consulta + operacao;
+  return {
+    juros, iof, boletos, consulta, operacao, custoTotal,
+    bruto, liquido: bruto - custoTotal,
+    efetivo: bruto > 0 ? (custoTotal / bruto) * 100 : 0,
+    titulos, clientes: clientes.size,
+    diasMedia: titulos ? Math.round(somaDias / titulos) : 0,
+    nClientesCobrados: clientes.size,
+  };
+}
+
+// ---------- component ----------
+export default function App() {
+  const [providers, setProviders] = useState(seedProviders);
+  const [receivables, setReceivables] = useState(seedReceivables);
+  const [settings, setSettings] = useState(DEFAULT_SETTINGS);
+  const [loaded, setLoaded] = useState(false);
+  const [note, setNote] = useState("");
+  const [showPaste, setShowPaste] = useState(false);
+  const [pasteText, setPasteText] = useState("");
+  const [showIof, setShowIof] = useState(false);
+  const fileRef = useRef(null);
+
+  // load persisted providers + settings
+  useEffect(() => {
+    (async () => {
+      try {
+        const res = await window.storage.get("cofre_dados");
+        if (res && res.value) {
+          const data = JSON.parse(res.value);
+          if (Array.isArray(data.providers) && data.providers.length) setProviders(data.providers);
+          if (data.settings) setSettings({ ...DEFAULT_SETTINGS, ...data.settings, dataAntecipacao: data.settings.dataAntecipacao || todayISO() });
+        }
+      } catch (e) { /* first run, keep seeds */ }
+      setLoaded(true);
+    })();
+  }, []);
+
+  // persist on change (after load)
+  useEffect(() => {
+    if (!loaded) return;
+    (async () => {
+      try { await window.storage.set("cofre_dados", JSON.stringify({ providers, settings })); } catch (e) {}
+    })();
+  }, [providers, settings, loaded]);
+
+  const flash = (msg) => { setNote(msg); setTimeout(() => setNote(""), 3500); };
+
+  // ---- providers ----
+  const updProvider = (id, patch) => setProviders((ps) => ps.map((p) => (p.id === id ? { ...p, ...patch } : p)));
+  const addProvider = () => setProviders((ps) => [...ps, { id: uid(), nome: "Novo fornecedor", taxaMensal: "0", cobraIof: true, tarifaPorTitulo: "0", tarifaPorCliente: "0", tarifaPorOperacao: "0" }]);
+  const delProvider = (id) => setProviders((ps) => ps.filter((p) => p.id !== id));
+
+  // ---- receivables ----
+  const updRec = (id, patch) => setReceivables((rs) => rs.map((r) => (r.id === id ? { ...r, ...patch } : r)));
+  const addRec = () => setReceivables((rs) => [...rs, { id: uid(), cliente: "", emissao: todayISO(), vencimento: todayISO(), valor: "" }]);
+  const delRec = (id) => setReceivables((rs) => rs.filter((r) => r.id !== id));
+
+  function rowsToReceivables(rows) {
+    if (!rows.length) return [];
+    let headerIdx = -1;
+    for (let i = 0; i < Math.min(rows.length, 5); i++) {
+      const joined = rows[i].map((c) => String(c).toLowerCase()).join("|");
+      if (/cliente|emiss|venc|valor|fatura|sacado/.test(joined)) { headerIdx = i; break; }
+    }
+    let cCli = 0, cEmi = 1, cVen = 2, cVal = 3, dataRows;
+    if (headerIdx >= 0) {
+      const h = rows[headerIdx].map((c) => String(c).toLowerCase());
+      const find = (...keys) => h.findIndex((x) => keys.some((k) => x.includes(k)));
+      let i;
+      if ((i = find("cliente", "sacado", "razao", "razão", "nome")) >= 0) cCli = i;
+      if ((i = find("emiss")) >= 0) cEmi = i;
+      if ((i = find("venc")) >= 0) cVen = i;
+      if ((i = find("valor", "fatura", "titulo", "título", "montante")) >= 0) cVal = i;
+      dataRows = rows.slice(headerIdx + 1);
+    } else dataRows = rows;
+    const out = [];
+    dataRows.forEach((r) => {
+      const cliente = String(r[cCli] ?? "").trim();
+      const emissao = toISO(parseDate(r[cEmi]));
+      const vencimento = toISO(parseDate(r[cVen]));
+      const valorNum = parseValor(r[cVal]);
+      if (!cliente && !vencimento && !valorNum) return;
+      out.push({ id: uid(), cliente, emissao, vencimento, valor: valorNum ? numToStr(valorNum) : "" });
+    });
+    return out;
+  }
+
+  async function onFile(e) {
+    const file = e.target.files?.[0];
+    if (!file) return;
+    try {
+      const buf = await file.arrayBuffer();
+      const wb = XLSX.read(buf, { cellDates: true });
+      const ws = wb.Sheets[wb.SheetNames[0]];
+      const rows = XLSX.utils.sheet_to_json(ws, { header: 1, raw: false, defval: "" });
+      const recs = rowsToReceivables(rows);
+      if (recs.length) { setReceivables(recs); flash(`${recs.length} faturas carregadas da planilha.`); }
+      else flash("Não encontrei faturas nesse arquivo. Confira as colunas.");
+    } catch (err) { flash("Não consegui ler o arquivo. Tente .xlsx ou .csv."); }
+    e.target.value = "";
+  }
+
+  function onPaste() {
+    const rows = pasteText.trim().split(/\r?\n/).map((l) => (l.indexOf("\t") > -1 ? l.split("\t") : l.split(";")));
+    const recs = rowsToReceivables(rows);
+    if (recs.length) { setReceivables(recs); flash(`${recs.length} faturas coladas.`); setShowPaste(false); setPasteText(""); }
+    else flash("Não reconheci as colunas. Cole 4 colunas: cliente, emissão, vencimento, valor.");
+  }
+
+  const totalBruto = useMemo(() => receivables.reduce((s, r) => s + parseValor(r.valor), 0), [receivables]);
+  const nClientes = useMemo(() => new Set(receivables.map((r) => (r.cliente || "").trim().toLowerCase()).filter(Boolean)).size, [receivables]);
+  const nTitulos = useMemo(() => receivables.filter((r) => parseValor(r.valor) > 0 && r.vencimento).length, [receivables]);
+
+  const results = useMemo(() => {
+    return providers
+      .map((p) => ({ p, r: calcProvider(p, receivables, settings) }))
+      .sort((a, b) => a.r.custoTotal - b.r.custoTotal);
+  }, [providers, receivables, settings]);
+
+  const cheapest = results[0];
+
+  return (
+    <div className="cofre">
+      <style>{CSS}</style>
+
+      <header className="hd">
+        <div className="hd-mark" aria-hidden>{vaultSvg}</div>
+        <div>
+          <div className="eyebrow">Comparador de antecipação de duplicatas</div>
+          <h1>Cofre</h1>
+          <p className="lede">Descubra qual fornecedor financeiro cobra menos para adiantar as suas faturas — e quanto sobra no seu caixa em cada opção.</p>
+        </div>
+      </header>
+
+      {note && <div className="note">{note}</div>}
+
+      {/* FATURAS */}
+      <section className="card">
+        <div className="sec-head">
+          <div>
+            <span className="num-tag">1</span>
+            <h2>Suas faturas</h2>
+          </div>
+          <div className="antec">
+            <label>Data da antecipação</label>
+            <input type="date" value={settings.dataAntecipacao} onChange={(e) => setSettings((s) => ({ ...s, dataAntecipacao: e.target.value }))} />
+          </div>
+        </div>
+        <p className="hint">Envie a planilha do seu sistema (cliente, emissão, vencimento, valor) ou digite à mão. Os dias de cada operação contam da data acima até o vencimento.</p>
+
+        <div className="import-row">
+          <button className="btn ghost" onClick={() => fileRef.current?.click()}><Upload size={15} /> Enviar planilha (.xlsx / .csv)</button>
+          <button className="btn ghost" onClick={() => setShowPaste((v) => !v)}>Colar da planilha</button>
+          <input ref={fileRef} type="file" accept=".xlsx,.xls,.csv" onChange={onFile} style={{ display: "none" }} />
+        </div>
+
+        {showPaste && (
+          <div className="paste">
+            <textarea value={pasteText} onChange={(e) => setPasteText(e.target.value)} placeholder={"Cole aqui direto do Excel ou Google Sheets (4 colunas).\nEx.:\nCliente A\t01/08/2026\t01/09/2026\t12.500,00"} />
+            <div className="paste-actions">
+              <button className="btn solid" onClick={onPaste}>Carregar</button>
+              <button className="btn ghost" onClick={() => { setShowPaste(false); setPasteText(""); }}>Cancelar</button>
+            </div>
+          </div>
+        )}
+
+        <div className="tbl-wrap">
+          <table className="tbl">
+            <thead>
+              <tr><th>Cliente</th><th>Emissão</th><th>Vencimento</th><th className="right">Valor (R$)</th><th aria-label="ações"></th></tr>
+            </thead>
+            <tbody>
+              {receivables.map((r) => (
+                <tr key={r.id}>
+                  <td><input value={r.cliente} onChange={(e) => updRec(r.id, { cliente: e.target.value })} placeholder="Nome do cliente" /></td>
+                  <td><input type="date" value={r.emissao} onChange={(e) => updRec(r.id, { emissao: e.target.value })} /></td>
+                  <td><input type="date" value={r.vencimento} onChange={(e) => updRec(r.id, { vencimento: e.target.value })} /></td>
+                  <td className="right"><input className="num" value={r.valor} onChange={(e) => updRec(r.id, { valor: e.target.value })} placeholder="0,00" /></td>
+                  <td><button className="icon-btn" onClick={() => delRec(r.id)} aria-label="Excluir fatura"><Trash2 size={15} /></button></td>
+                </tr>
+              ))}
+              {receivables.length === 0 && (
+                <tr><td colSpan={5} className="empty">Nenhuma fatura ainda. Envie a planilha ou adicione uma linha.</td></tr>
+              )}
+            </tbody>
+          </table>
+        </div>
+
+        <div className="tbl-foot">
+          <button className="btn ghost sm" onClick={addRec}><Plus size={14} /> Adicionar fatura</button>
+          {receivables.length > 0 && <button className="btn ghost sm" onClick={() => setReceivables([])}>Limpar lista</button>}
+          <div className="totals">
+            <span><b>{nTitulos}</b> títulos</span>
+            <span><b>{nClientes}</b> clientes</span>
+            <span>Total <b>{brl(totalBruto)}</b></span>
+          </div>
+        </div>
+      </section>
+
+      {/* FORNECEDORES */}
+      <section className="card">
+        <div className="sec-head">
+          <div><span className="num-tag">2</span><h2>Seus fornecedores</h2></div>
+          <button className="btn solid sm" onClick={addProvider}><Plus size={14} /> Adicionar fornecedor</button>
+        </div>
+        <p className="hint">Cadastre cada fornecedor uma vez — eles ficam salvos e reaparecem toda vez que você abrir, em qualquer aparelho.</p>
+
+        <div className="prov-grid">
+          {providers.map((p) => (
+            <div className="prov" key={p.id}>
+              <div className="prov-top">
+                <input className="prov-name" value={p.nome} onChange={(e) => updProvider(p.id, { nome: e.target.value })} />
+                <button className="icon-btn" onClick={() => delProvider(p.id)} aria-label="Excluir fornecedor"><X size={16} /></button>
+              </div>
+              <div className="field"><label>Taxa ao mês (%)</label><input className="num" value={p.taxaMensal} onChange={(e) => updProvider(p.id, { taxaMensal: e.target.value })} placeholder="0,00" /></div>
+              <div className="field"><label>Tarifa por título / boleto (R$)</label><input className="num" value={p.tarifaPorTitulo} onChange={(e) => updProvider(p.id, { tarifaPorTitulo: e.target.value })} placeholder="0,00" /></div>
+              <div className="field"><label>Consulta por cliente / CNPJ (R$)</label><input className="num" value={p.tarifaPorCliente} onChange={(e) => updProvider(p.id, { tarifaPorCliente: e.target.value })} placeholder="0,00" /></div>
+              <div className="field"><label>Tarifa fixa da operação / TAC (R$)</label><input className="num" value={p.tarifaPorOperacao} onChange={(e) => updProvider(p.id, { tarifaPorOperacao: e.target.value })} placeholder="0,00" /></div>
+              <label className="toggle">
+                <input type="checkbox" checked={p.cobraIof} onChange={(e) => updProvider(p.id, { cobraIof: e.target.checked })} />
+                <span>Cobra IOF nesta operação</span>
+              </label>
+            </div>
+          ))}
+        </div>
+
+        <button className="iof-toggle" onClick={() => setShowIof((v) => !v)}><Info size={13} /> {showIof ? "Ocultar" : "Ver"} parâmetros de IOF</button>
+        {showIof && (
+          <div className="iof-box">
+            <p>Valores oficiais para desconto de duplicatas. Só mexa se o seu contrato disser algo diferente.</p>
+            <div className="iof-fields">
+              <div className="field"><label>IOF ao dia (%)</label><input className="num" value={settings.iofDiario} onChange={(e) => setSettings((s) => ({ ...s, iofDiario: e.target.value }))} /></div>
+              <div className="field"><label>IOF adicional fixo (%)</label><input className="num" value={settings.iofAdicional} onChange={(e) => setSettings((s) => ({ ...s, iofAdicional: e.target.value }))} /></div>
+            </div>
+          </div>
+        )}
+      </section>
+
+      {/* RESULTADO */}
+      <section className="card result-card">
+        <div className="sec-head"><div><span className="num-tag">3</span><h2>Qual custa menos</h2></div></div>
+
+        {results.length === 0 || nTitulos === 0 ? (
+          <div className="empty big">Cadastre pelo menos um fornecedor e uma fatura com valor e vencimento para ver a comparação.</div>
+        ) : (
+          <div className="results">
+            {results.map(({ p, r }, i) => {
+              const isWin = i === 0;
+              const delta = r.custoTotal - cheapest.r.custoTotal;
+              return (
+                <div className={"res" + (isWin ? " win" : "")} key={p.id}>
+                  {isWin && <div className="res-dial" aria-hidden>{vaultSvg}</div>}
+                  <div className="res-head">
+                    <div>
+                      {isWin ? <span className="badge good"><Crown size={13} /> Menor custo</span> : <span className="badge">{i + 1}º</span>}
+                      <h3>{p.nome}</h3>
+                    </div>
+                    <div className="res-cost">
+                      <span className="cost-label">Custo total</span>
+                      <span className="cost-val">{brl(r.custoTotal)}</span>
+                      <span className="cost-eff">{pct(r.efetivo)} do valor</span>
+                    </div>
+                  </div>
+
+                  {!isWin && delta > 0 && <div className="delta">Custa <b>{brl(delta)}</b> a mais que o {cheapest.p.nome}</div>}
+
+                  <div className="liquido"><span>Você recebe</span><b>{brl(r.liquido)}</b><span className="of">de {brl(r.bruto)}</span></div>
+
+                  <div className="breakdown">
+                    <Line k="Juros da taxa" v={r.juros} />
+                    {p.cobraIof && <Line k="IOF" v={r.iof} />}
+                    {r.boletos > 0 && <Line k={`Tarifa por título (${r.titulos}×)`} v={r.boletos} />}
+                    {r.consulta > 0 && <Line k={`Consulta CNPJ (${r.nClientesCobrados}×)`} v={r.consulta} />}
+                    {r.operacao > 0 && <Line k="Tarifa da operação / TAC" v={r.operacao} />}
+                  </div>
+                </div>
+              );
+            })}
+          </div>
+        )}
+        <p className="disclaimer">Estimativa com base nas taxas que você cadastrou e nas convenções de mercado (taxa mensal ÷ 30 × dias, IOF 0,38% + 0,0041%/dia). Confirme as condições exatas com cada fornecedor antes de fechar — contratos podem ter cobranças específicas.</p>
+      </section>
+
+      <footer className="ft">Seus fornecedores ficam salvos automaticamente. As faturas não são salvas — carregue o lote sempre que for simular.</footer>
+    </div>
+  );
+}
+
+function Line({ k, v }) {
+  return (
+    <div className="bk-line"><span>{k}</span><span className="num">{brl(v)}</span></div>
+  );
+}
+
+const vaultSvg = (
+  <svg viewBox="0 0 48 48" width="100%" height="100%">
+    <circle cx="24" cy="24" r="20" fill="none" stroke="currentColor" strokeWidth="2" opacity="0.9" />
+    <circle cx="24" cy="24" r="13" fill="none" stroke="currentColor" strokeWidth="1.5" opacity="0.55" />
+    <circle cx="24" cy="24" r="3" fill="currentColor" />
+    {[0, 45, 90, 135, 180, 225, 270, 315].map((a) => {
+      const rad = (a * Math.PI) / 180;
+      return <line key={a} x1={24 + 13 * Math.cos(rad)} y1={24 + 13 * Math.sin(rad)} x2={24 + 20 * Math.cos(rad)} y2={24 + 20 * Math.sin(rad)} stroke="currentColor" strokeWidth="1.5" opacity="0.7" />;
+    })}
+    <line x1="24" y1="24" x2="24" y2="9" stroke="currentColor" strokeWidth="2" />
+  </svg>
+);
+
+const CSS = `
+.cofre{
+  --ink:#14202E; --ink-soft:#5C6B7A; --paper:#E9ECEF; --surface:#FFFFFF;
+  --line:#DBDFE4; --vault:#9A7B33; --vault-2:#BE9A44; --good:#0E7A50; --good-bg:#E4F1EA;
+  max-width:920px; margin:0 auto; padding:28px 18px 60px; color:var(--ink);
+  background:var(--paper); font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,Helvetica,Arial,sans-serif;
+  line-height:1.5; -webkit-font-smoothing:antialiased;
+}
+.cofre *{box-sizing:border-box;}
+.cofre .num{font-variant-numeric:tabular-nums; letter-spacing:-0.01em;}
+.cofre .eyebrow{font-size:11px; text-transform:uppercase; letter-spacing:0.14em; color:var(--vault); font-weight:700;}
+.hd{display:flex; gap:18px; align-items:flex-start; margin-bottom:22px;}
+.hd-mark{width:52px; height:52px; flex:none; color:var(--vault); margin-top:4px;}
+.hd h1{font-size:34px; line-height:1.05; margin:2px 0 6px; font-weight:800; letter-spacing:-0.02em;}
+.lede{color:var(--ink-soft); font-size:15px; margin:0; max-width:60ch;}
+.note{background:var(--ink); color:#fff; padding:10px 14px; border-radius:8px; font-size:13.5px; margin-bottom:16px;}
+.card{background:var(--surface); border:1px solid var(--line); border-radius:14px; padding:20px 20px 22px; margin-bottom:18px;}
+.sec-head{display:flex; justify-content:space-between; align-items:flex-start; gap:14px; flex-wrap:wrap;}
+.sec-head>div:first-child{display:flex; align-items:center; gap:11px;}
+.num-tag{width:26px; height:26px; border-radius:7px; background:var(--ink); color:#fff; display:inline-flex; align-items:center; justify-content:center; font-size:14px; font-weight:700;}
+.card h2{font-size:19px; margin:0; font-weight:700; letter-spacing:-0.01em;}
+.hint{color:var(--ink-soft); font-size:13px; margin:12px 0 14px;}
+.antec{display:flex; flex-direction:column; gap:4px;}
+.antec label{font-size:11px; text-transform:uppercase; letter-spacing:0.08em; color:var(--ink-soft); font-weight:600;}
+.antec input{border:1px solid var(--line); border-radius:8px; padding:7px 9px; font-size:14px; color:var(--ink); background:#fff;}
+.import-row{display:flex; gap:8px; flex-wrap:wrap; margin-bottom:12px;}
+.btn{border:1px solid var(--line); background:#fff; color:var(--ink); border-radius:9px; padding:8px 13px; font-size:13.5px; font-weight:600; cursor:pointer; display:inline-flex; align-items:center; gap:7px; transition:.14s;}
+.btn:hover{border-color:var(--ink); }
+.btn.sm{padding:6px 11px; font-size:13px;}
+.btn.solid{background:var(--ink); color:#fff; border-color:var(--ink);}
+.btn.solid:hover{background:#20303f;}
+.btn.ghost:hover{background:#f4f6f7;}
+.paste{margin-bottom:14px;}
+.paste textarea{width:100%; min-height:96px; border:1px solid var(--line); border-radius:10px; padding:11px; font-size:13px; font-family:inherit; resize:vertical;}
+.paste-actions{display:flex; gap:8px; margin-top:8px;}
+.tbl-wrap{overflow-x:auto; border:1px solid var(--line); border-radius:10px;}
+.tbl{width:100%; border-collapse:collapse; min-width:560px;}
+.tbl th{text-align:left; font-size:11px; text-transform:uppercase; letter-spacing:0.07em; color:var(--ink-soft); font-weight:700; padding:10px 10px; border-bottom:1px solid var(--line); background:#f7f8f9;}
+.tbl th.right{text-align:right;}
+.tbl td{padding:5px 7px; border-bottom:1px solid var(--line);}
+.tbl tr:last-child td{border-bottom:none;}
+.tbl input{width:100%; border:1px solid transparent; border-radius:7px; padding:7px 8px; font-size:14px; color:var(--ink); background:transparent; font-family:inherit;}
+.tbl input:focus{outline:none; border-color:var(--vault); background:#fff;}
+.tbl td.right input{text-align:right;}
+.icon-btn{border:none; background:none; color:var(--ink-soft); cursor:pointer; padding:6px; border-radius:6px; display:inline-flex;}
+.icon-btn:hover{color:#B23A32; background:#f7f8f9;}
+.empty{text-align:center; color:var(--ink-soft); padding:20px; font-size:13.5px;}
+.empty.big{padding:34px 20px; font-size:14.5px;}
+.tbl-foot{display:flex; align-items:center; gap:10px; margin-top:12px; flex-wrap:wrap;}
+.totals{margin-left:auto; display:flex; gap:16px; font-size:13.5px; color:var(--ink-soft);}
+.totals b{color:var(--ink);}
+.prov-grid{display:grid; grid-template-columns:repeat(auto-fill,minmax(240px,1fr)); gap:14px; margin-bottom:8px;}
+.prov{border:1px solid var(--line); border-radius:12px; padding:14px;}
+.prov-top{display:flex; align-items:center; gap:8px; margin-bottom:12px;}
+.prov-name{flex:1; font-size:16px; font-weight:700; border:1px solid transparent; border-radius:7px; padding:5px 7px; color:var(--ink); background:transparent; font-family:inherit;}
+.prov-name:focus{outline:none; border-color:var(--vault); background:#fff;}
+.field{margin-bottom:9px;}
+.field label{display:block; font-size:11.5px; color:var(--ink-soft); margin-bottom:3px;}
+.field input{width:100%; border:1px solid var(--line); border-radius:8px; padding:7px 9px; font-size:14px; color:var(--ink); font-family:inherit;}
+.field input:focus{outline:none; border-color:var(--vault);}
+.toggle{display:flex; align-items:center; gap:8px; font-size:13px; color:var(--ink); margin-top:11px; cursor:pointer;}
+.toggle input{width:16px; height:16px; accent-color:var(--vault);}
+.iof-toggle{margin-top:14px; border:none; background:none; color:var(--vault); font-size:12.5px; font-weight:600; cursor:pointer; display:inline-flex; align-items:center; gap:6px; padding:0;}
+.iof-box{margin-top:10px; background:#f7f8f9; border-radius:10px; padding:13px;}
+.iof-box p{font-size:12.5px; color:var(--ink-soft); margin:0 0 10px;}
+.iof-fields{display:flex; gap:12px; flex-wrap:wrap;}
+.iof-fields .field{margin:0; min-width:130px;}
+.result-card{background:linear-gradient(180deg,#fff,#fbfcfc);}
+.results{display:flex; flex-direction:column; gap:14px; margin-top:6px;}
+.res{position:relative; border:1px solid var(--line); border-radius:13px; padding:17px 18px; overflow:hidden;}
+.res.win{border:1.5px solid var(--good); background:var(--good-bg);}
+.res-dial{position:absolute; right:-16px; top:-16px; width:120px; height:120px; color:var(--good); opacity:0.10; pointer-events:none;}
+.res-head{display:flex; justify-content:space-between; align-items:flex-start; gap:14px;}
+.res-head h3{font-size:20px; margin:7px 0 0; font-weight:700; letter-spacing:-0.01em;}
+.badge{display:inline-flex; align-items:center; gap:5px; font-size:11px; font-weight:700; text-transform:uppercase; letter-spacing:0.06em; color:var(--ink-soft); background:#eef0f2; padding:3px 9px; border-radius:20px;}
+.badge.good{color:#fff; background:var(--good);}
+.res-cost{text-align:right; display:flex; flex-direction:column;}
+.cost-label{font-size:11px; text-transform:uppercase; letter-spacing:0.07em; color:var(--ink-soft);}
+.cost-val{font-size:24px; font-weight:800; letter-spacing:-0.02em; font-variant-numeric:tabular-nums;}
+.res.win .cost-val{color:var(--good);}
+.cost-eff{font-size:12px; color:var(--ink-soft); font-variant-numeric:tabular-nums;}
+.delta{margin-top:10px; font-size:13.5px; color:#B23A32;}
+.delta b{font-variant-numeric:tabular-nums;}
+.liquido{margin-top:12px; display:flex; align-items:baseline; gap:9px; padding-top:12px; border-top:1px dashed var(--line);}
+.liquido>span:first-child{font-size:12px; text-transform:uppercase; letter-spacing:0.06em; color:var(--ink-soft);}
+.liquido b{font-size:18px; font-variant-numeric:tabular-nums;}
+.liquido .of{font-size:12.5px; color:var(--ink-soft);}
+.breakdown{margin-top:12px; display:grid; gap:5px;}
+.bk-line{display:flex; justify-content:space-between; font-size:13px; color:var(--ink-soft);}
+.bk-line .num{color:var(--ink);}
+.disclaimer{margin-top:16px; font-size:11.5px; color:var(--ink-soft); line-height:1.5;}
+.ft{text-align:center; font-size:12px; color:var(--ink-soft); margin-top:8px;}
+@media (max-width:560px){
+  .hd h1{font-size:28px;} .cost-val{font-size:20px;} .card{padding:16px;}
+  .sec-head{flex-direction:column;} .antec{width:100%;}
+}
+`;
