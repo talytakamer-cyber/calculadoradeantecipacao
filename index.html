@@ -252,30 +252,37 @@ function App() {
 
   function rowsToReceivables(rows) {
     if (!rows.length) return [];
+    const norm = (c) => String(c == null ? "" : c).trim().toLowerCase();
+    // Acha a linha de cabeçalho de verdade: precisa ter "cliente" E (vencimento ou valor).
+    // Isso ignora linhas de título como "REL. FATURAS PERIODO".
     let headerIdx = -1;
-    for (let i = 0; i < Math.min(rows.length, 5); i++) {
-      const joined = rows[i].map((c) => String(c).toLowerCase()).join("|");
-      if (/cliente|emiss|venc|valor|fatura|sacado/.test(joined)) { headerIdx = i; break; }
+    for (let i = 0; i < Math.min(rows.length, 20); i++) {
+      const cells = rows[i].map(norm);
+      const hasCli = cells.some((x) => x === "cliente" || x.includes("cliente") || x === "sacado");
+      const hasVen = cells.some((x) => x.includes("venc"));
+      const hasVal = cells.some((x) => x.includes("valor") || x.includes("vlr") || x === "saldo");
+      if (hasCli && (hasVen || hasVal)) { headerIdx = i; break; }
     }
     let cCli = 0, cEmi = 1, cVen = 2, cVal = 3, dataRows;
     if (headerIdx >= 0) {
-      const h = rows[headerIdx].map((c) => String(c).toLowerCase());
-      const find = (...keys) => h.findIndex((x) => keys.some((k) => x.includes(k)));
+      const h = rows[headerIdx].map(norm);
+      const pick = (preds) => { for (const p of preds) { const idx = h.findIndex(p); if (idx >= 0) return idx; } return -1; };
       let i;
-      if ((i = find("cliente", "sacado", "razao", "razão", "nome")) >= 0) cCli = i;
-      if ((i = find("emiss")) >= 0) cEmi = i;
-      if ((i = find("venc")) >= 0) cVen = i;
-      if ((i = find("valor", "fatura", "titulo", "título", "montante")) >= 0) cVal = i;
+      if ((i = pick([(x) => x === "cliente", (x) => x.includes("cliente"), (x) => x === "sacado", (x) => x.includes("razao"), (x) => x.includes("razão")])) >= 0) cCli = i;
+      if ((i = pick([(x) => x.includes("emiss")])) >= 0) cEmi = i;
+      if ((i = pick([(x) => x === "vencimen", (x) => x.includes("vencimen"), (x) => x === "venc ori", (x) => x.includes("venc")])) >= 0) cVen = i;
+      if ((i = pick([(x) => x.includes("vlr fatur"), (x) => x === "valor", (x) => x.includes("valor"), (x) => x === "saldo", (x) => x.includes("vlr")])) >= 0) cVal = i;
       dataRows = rows.slice(headerIdx + 1);
     } else dataRows = rows;
     const out = [];
     dataRows.forEach((r) => {
+      const venc = parseDate(r[cVen]);
+      const valorNum = parseValor(r[cVal]);
+      // Só entra quem tem vencimento válido e valor positivo — descarta códigos, títulos, totais e linhas em branco.
+      if (!venc || valorNum <= 0) return;
       const cliente = String(r[cCli] == null ? "" : r[cCli]).trim();
       const emissao = toISO(parseDate(r[cEmi]));
-      const vencimento = toISO(parseDate(r[cVen]));
-      const valorNum = parseValor(r[cVal]);
-      if (!cliente && !vencimento && !valorNum) return;
-      out.push({ id: uid(), cliente, emissao, vencimento, valor: valorNum ? numToStr(valorNum) : "" });
+      out.push({ id: uid(), cliente, emissao, vencimento: toISO(venc), valor: numToStr(valorNum) });
     });
     return out;
   }
